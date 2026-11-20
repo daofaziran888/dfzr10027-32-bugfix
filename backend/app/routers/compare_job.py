@@ -1,4 +1,4 @@
-"""对比分析接口：维护对比任务，覆盖执行对比、标记完成、标记差异等动作。"""
+"""对比分析接口：维护对比任务，覆盖差异清单、本班销账与下游报表读取。"""
 from __future__ import annotations
 
 import csv
@@ -63,6 +63,84 @@ def export_entries(
     return StreamingResponse(
         iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="compare_job.csv"'})
+
+
+@router.get("/diff-rows")
+def get_diff_rows(
+    batch_id: str | None = Query(default=None, description="批次号，默认最新一批"),
+    link_code: str | None = Query(default=None, description="链路编号"),
+) -> dict:
+    """按触点发布差异清单：两侧金额与差异同一精度，差异可用两侧金额复算。"""
+    resolved = batch_id or service.latest_batch_id(link_code)
+    rows = service.published_rows(resolved, link_code)
+    precision = 2
+    for row in rows:
+        precision = int(row.get("精度位数", precision))
+        break
+    comparable = [row for row in rows if row.get("可比状态") == "双方可比"]
+    return {
+        "batch_id": resolved,
+        "link_code": link_code,
+        "precision": precision,
+        "items": rows,
+        "total": len(rows),
+        "coverage": {
+            "比较覆盖触点数": len(rows),
+            "已确认差异触点数": sum(1 for row in rows if row.get("已确认差异")),
+            "已核平触点数": sum(
+                1 for row in rows
+                if row.get("可比状态") == "双方可比" and not row.get("已确认差异")),
+            "单侧待补触点数": sum(1 for row in rows if row.get("可比状态") != "双方可比"),
+        },
+        "empty_reason": (
+            "尚未执行归因对比：该链路还没有已发布的差异批次"
+            if resolved is None else service._empty_reason(rows, comparable)
+        ),
+    }
+
+
+@router.get("/diff-batches")
+def get_diff_batches(link_code: str | None = Query(default=None)) -> dict:
+    """列出已发布的差异批次及其覆盖口径，便于下游按批次复算。"""
+    items = service.batches(link_code)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/claimable")
+def get_claimable(link_code: str | None = Query(default=None)) -> dict:
+    """本班可销账清单：只包含双方可比、尚未销账的触点。"""
+    return service.claimable(link_code)
+
+
+@router.post("/settle", response_model=ActionResult)
+def settle(payload: dict) -> ActionResult:
+    """按触点销账；同一批次同一触点重复提交不会重复销账。"""
+    touch_types = payload.get("触点类型") or payload.get("touches") or []
+    if not isinstance(touch_types, list) or not touch_types:
+        return ActionResult(ok=False, message="请至少选择一个触点进行销账")
+    settled_by = str(payload.get("销账人") or payload.get("settled_by") or "值班管理员")
+    result = service.settle(
+        [str(item) for item in touch_types],
+        settled_by=settled_by,
+        batch_id=payload.get("batch_id"),
+        link_code=payload.get("link_code"),
+    )
+    if result["已销账"]:
+        message = f"已销账 {len(result['已销账'])} 个触点"
+    elif result["重复销账"]:
+        message = "本批触点已销账，未重复销账"
+    else:
+        message = "所选触点暂不可销账"
+    return ActionResult(ok=True, message=message, entry=result)
+
+
+@router.get("/report")
+def get_report(
+    batch_id: str | None = Query(default=None),
+    link_code: str | None = Query(default=None),
+) -> dict:
+    """下游报表读取：分别说明比较覆盖的触点与已确认差异的触点。"""
+    return service.report_summary(batch_id, link_code)
 
 
 @router.get("/{entry_id}", response_model=dict)

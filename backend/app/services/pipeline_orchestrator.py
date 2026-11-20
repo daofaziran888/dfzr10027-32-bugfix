@@ -11,40 +11,35 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from app.fixtures import (
+    ATTR_NOTRADE_TOUCHES,
+    ATTR_PENDING_TOUCHES,
+    ATTR_PRECISION_LATE_TOUCHES,
+    ATTR_PRECISION_TOUCHES,
     ATTRIBUTION_TOUCHES,
     COHORT_USERS,
     DATA_MART_ROWS,
     DIMENSIONS,
     EXPERIMENT_RESULTS,
+    LATE_ATTRIBUTION_TOUCHES,
     METRIC_DEFS,
     QUALITY_CHECK_SAMPLES,
     TREND_POINTS,
 )
+from app.services.attribution_engine import compute_attribution_models
+from app.services.pipeline_results import list_results, read_result, write_result
 from app.store import store
 
 # ---------------------------------------------------------------------------
 # 内部辅助
 # ---------------------------------------------------------------------------
 
-def _write_result(pipeline_id: str, payload: dict[str, Any]) -> None:
-    """把管道产物写入 store._pipeline_results，支持追加与幂等覆盖。"""
-    table = store.rows("_pipeline_results")
-    # 若同 pipeline_id 已存在则更新，否则追加
-    for row in table:
-        if row.get("pipeline_id") == pipeline_id:
-            row.update(payload)
-            row["updated_at"] = datetime.now().isoformat()
-            return
-    entry = {"pipeline_id": pipeline_id, "created_at": datetime.now().isoformat()}
-    entry.update(payload)
-    table.append(entry)
+def _write_result(pipeline_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """把管道产物写入 store._pipeline_results，按 pipeline_id 幂等覆盖。"""
+    return write_result(pipeline_id, payload)
 
 
 def _read_result(pipeline_id: str) -> dict[str, Any] | None:
-    for row in store.rows("_pipeline_results"):
-        if row.get("pipeline_id") == pipeline_id:
-            return dict(row)
-    return None
+    return read_result(pipeline_id)
 
 
 def _to_float(val: Any) -> float:
@@ -396,88 +391,96 @@ def run_quality_scan() -> dict[str, Any]:
 # Pipeline 7: attribution -> metric_def -> compare_job
 # ---------------------------------------------------------------------------
 
-def run_attribution_compare_pipeline(link_code: str | None = None) -> dict[str, Any]:
-    """读取归因 fixtures，按触点类型做首次/末次/线性权重分配，生成指标对比产物。"""
-    touches = list(ATTRIBUTION_TOUCHES)
+ATTRIBUTION_LINKS: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {
+    # 链路 -> (初始批次触点, 迟到补报触点)
+    "ATTR-001": (ATTRIBUTION_TOUCHES, LATE_ATTRIBUTION_TOUCHES),
+    "ATTR-002": (ATTRIBUTION_TOUCHES, []),
+    "ATTR-003": (ATTRIBUTION_TOUCHES, []),
+    "ATTR-PRECISION": (ATTR_PRECISION_TOUCHES, ATTR_PRECISION_LATE_TOUCHES),
+    "ATTR-NOTRADE": (ATTR_NOTRADE_TOUCHES, []),
+    "ATTR-PENDING": (ATTR_PENDING_TOUCHES, []),
+}
+
+
+def attribution_touches_for(
+    link_code: str, late_batch: bool = False,
+) -> list[dict[str, Any]]:
+    """按链路取触点；``late_batch`` 决定是否并入迟到补报的那几条。"""
+    base, late = ATTRIBUTION_LINKS.get(link_code, (ATTRIBUTION_TOUCHES, []))
+    touches = list(base)
+    if late_batch:
+        touches.extend(late)
+    return [t for t in touches if t.get("链路编号") == link_code]
+
+
+def _publish_attribution_diff(
+    link_code: str,
+    touches: list[dict[str, Any]],
+    *,
+    batch_id: str,
+    precision: int,
+) -> dict[str, Any]:
+    """把归因对比结果同步发到对比任务的差异清单。
+
+    延迟 import 避免与 compare_job 形成循环依赖。
+    """
+    from app.services.compare_job import CompareJobService
+
+    return CompareJobService().publish_diff_rows(
+        link_code, touches, batch_id=batch_id, precision=precision)
+
+
+def run_attribution_compare_pipeline(
+    link_code: str | None = None,
+    late_batch: bool = False,
+    batch_id: str | None = None,
+) -> dict[str, Any]:
+    """读取归因 fixtures，按触点类型做首次/末次/线性权重分配，生成指标对比产物。
+
+    ``late_batch=True`` 时把补报触点一起并入计算；``batch_id`` 相同时重复
+    执行只更新同一批差异行，不追加重复行，已销账状态也不会被冲掉。
+    """
     if link_code is None:
         link_code = "ATTR-001"
+    touches = attribution_touches_for(link_code, late_batch)
 
-    link_touches = [t for t in touches if t.get("链路编号") == link_code]
-    if not link_touches:
-        return {"error": "链路无数据"}
+    precision = 2
+    for d in METRIC_DEFS:
+        if d.get("指标编号") == "METR-GMV":
+            precision = _to_int(d.get("精度位数", 2))
+            break
 
-    # 按 user_id 聚合
-    users: dict[str, list[dict]] = {}
-    for t in link_touches:
-        uid = t["user_id"]
-        users.setdefault(uid, []).append(t)
+    result = compute_attribution_models(link_code, touches, precision=precision)
+    if "error" in result:
+        return result
 
-    # 三种归因模型
-    first_touch: dict[str, float] = {}
-    last_touch: dict[str, float] = {}
-    linear_touch: dict[str, float] = {}
+    if batch_id is None:
+        batch_id = f"{link_code}:{'late' if late_batch else 'initial'}"
+    result["batch_id"] = batch_id
+    result["late_batch_applied"] = bool(late_batch)
+    result["source_touch_count"] = len([t for t in touches if t.get("链路编号") == link_code])
 
-    for uid, ts in users.items():
-        ts_sorted = sorted(ts, key=lambda x: x["触点序号"])
-        conv_amount = _to_float(ts_sorted[-1].get("贡献金额"))
-        if conv_amount <= 0:
-            continue
-        # 首次
-        ft = ts_sorted[0]["触点类型"]
-        first_touch[ft] = first_touch.get(ft, 0.0) + conv_amount
-        # 末次（转化事件前最后一个有效触点）
-        lt_candidates = [t for t in ts_sorted if t["触点类型"] != "下单"]
-        if lt_candidates:
-            lt = lt_candidates[-1]["触点类型"]
-            last_touch[lt] = last_touch.get(lt, 0.0) + conv_amount
-        # 线性
-        n = len([t for t in ts_sorted if t["触点类型"] != "下单"])
-        if n > 0:
-            share = conv_amount / n
-            for t in ts_sorted:
-                if t["触点类型"] != "下单":
-                    linear_touch[t["触点类型"]] = linear_touch.get(t["触点类型"], 0.0) + share
+    # 差异清单与管道产物同批发布：差异行、覆盖口径、已发布合计一起可见。
+    _publish_attribution_diff(link_code, touches, batch_id=batch_id, precision=precision)
 
-    # 归一化到指标定义口径
-    total_first = sum(first_touch.values())
-    total_last = sum(last_touch.values())
-    total_linear = sum(linear_touch.values())
-
-    result = {
+    write_result("attribution_metric_compare", {
+        "batch_id": batch_id,
         "link_code": link_code,
-        "user_count": len(users),
-        "models": {
-            "first_touch": {k: round(v, 2) for k, v in first_touch.items()},
-            "last_touch": {k: round(v, 2) for k, v in last_touch.items()},
-            "linear": {k: round(v, 2) for k, v in linear_touch.items()},
-        },
-        "totals": {
-            "first_touch": round(total_first, 2),
-            "last_touch": round(total_last, 2),
-            "linear": round(total_linear, 2),
-        },
-    }
-
-    # 写入对比任务可消费的差异数据
-    diffs: list[dict] = []
-    all_types = set(first_touch) | set(last_touch) | set(linear_touch)
-    for t in all_types:
-        f = first_touch.get(t, 0.0)
-        l = last_touch.get(t, 0.0)
-        diffs.append({
-            "触点类型": t,
-            "首次归因": round(f, 2),
-            "末次归因": round(l, 2),
-            "差异": round(abs(f - l), 2),
-        })
-    result["compare_rows"] = diffs
-
-    _write_result("attribution_metric_compare", {
+        "late_batch_applied": result["late_batch_applied"],
         "source_modules": ["attribution", "metric_def"],
         "target_module": "compare_job",
         "payload": result,
     })
     return result
+
+
+def list_attribution_compare_batches(link_code: str | None = None) -> list[dict[str, Any]]:
+    """读出已发布的归因对比批次，供对比任务按正式金额复算差异。"""
+    rows = list_results("attribution_metric_compare")
+    if link_code is not None:
+        rows = [r for r in rows if r.get("link_code") == link_code]
+    rows.sort(key=lambda r: str(r.get("batch_id", "")))
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -497,5 +500,5 @@ def run_all_pipelines() -> dict[str, Any]:
     }
 
 
-def list_pipeline_results() -> list[dict[str, Any]]:
-    return [dict(r) for r in store.rows("_pipeline_results")]
+def list_pipeline_results(pipeline_id: str | None = None) -> list[dict[str, Any]]:
+    return list_results(pipeline_id)
